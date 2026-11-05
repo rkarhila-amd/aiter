@@ -57,6 +57,7 @@ def compile_pa_decode_ps_reduce(
     pairs: bool = False,
     parallel_groups: int = 1,
     num_xcds: int = 0,
+    ragged_rows: bool = False,
 ):
     """Build PA decode's partitioned-softmax reducer.
 
@@ -184,6 +185,8 @@ def compile_pa_decode_ps_reduce(
         kernel_name += f"_g{groups}"
     if num_xcds:
         kernel_name += f"_xcd{num_xcds}"
+    if ragged_rows:
+        kernel_name += "_ragged"
 
     @flyc.kernel(name=kernel_name, known_block_size=block)
     def pa_decode_reduce_kernel(
@@ -207,6 +210,9 @@ def compile_pa_decode_ps_reduce(
         num_ctas: fx.Int32,
         rows_magic: fx.Int32,
         seq_magic: fx.Int32,
+        qo_row_base_ptr: fx.Pointer,
+        qo_indirect: fx.Int32,
+        batch_size: fx.Int32,
     ):
         if fx.const_expr(num_xcds > 0):
             # Hardware deals linear workgroup ids round-robin over XCDs. Give
@@ -244,12 +250,34 @@ def compile_pa_decode_ps_reduce(
         lane = fx.thread_idx.x & fx.Int32(wave - 1)
         group_idx = urem_const(row_idx, query_group_size)
         query_idx = udiv_const(row_idx, query_group_size)
-        output_base = (
+        # Packed output lands at qo_row_base[seq] + query position. Dense
+        # output keeps the 5D batch stride. The base load is unconditional.
+        # Rows past a ragged width cannot be dropped with a function return
+        # (scf.if does not skip later stores) or a predicated store (the
+        # output pointer is a closure). They land in the unused tail
+        # [indptr[batch], batch * max_q), one private slot per dead query.
+        row_bases = fx.recast_iter(fx.Int32, qo_row_base_ptr)
+        loaded = fx.Int32(row_bases[batch_idx])
+        row = loaded + query_idx
+        if fx.const_expr(ragged_rows):
+            qlen = fx.Int32(row_bases[batch_idx + fx.Int32(1)]) - loaded
+            total = fx.Int32(row_bases[batch_size])
+            max_q = udiv_const(query_rows, query_group_size)
+            tail = total + batch_idx * max_q + query_idx - (loaded + qlen)
+            row = (query_idx < qlen).select(row, tail)
+        packed_base = (
+            row * stride_output_len
+            + kv_head_idx * stride_output_kv_head
+            + group_idx * stride_output_group_size
+        )
+        dense_base = (
             batch_idx * stride_output_bs
             + query_idx * stride_output_len
             + kv_head_idx * stride_output_kv_head
             + group_idx * stride_output_group_size
         )
+        use_packed = qo_indirect != fx.Int32(0)
+        output_base = use_packed.select(packed_base, dense_base)
         if fx.const_expr(use_sinks):
             sink_token = fx.recast_iter(sink_dtype, sink_token_ptr)
             sink_value = fx.Float32(
@@ -617,6 +645,8 @@ def compile_pa_decode_ps_reduce(
         reduce_info: fx.Pointer,
         rows_magic: fx.Int32,
         seq_magic: fx.Int32,
+        qo_row_base: fx.Pointer,
+        qo_indirect: fx.Int32,
         stream: fx.Stream,
     ):
         query_rows = query_seq_len * fx.Int32(query_group_size)
@@ -642,6 +672,9 @@ def compile_pa_decode_ps_reduce(
             num_ctas,
             rows_magic,
             seq_magic,
+            qo_row_base,
+            qo_indirect,
+            batch_size,
         ).launch(
             grid=(
                 (num_ctas, 1, 1)

@@ -37,6 +37,19 @@ from .kernels.pa_decode_reduce import (
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
 
 
+_DENSE_ROW_BASE: dict = {}
+
+
+def _dense_row_base(num_seqs: int, query_length: int, device: torch.device) -> torch.Tensor:
+    """seq * query_length, cached so dense decode does not allocate per call."""
+    key = (num_seqs, query_length, device.type, device.index)
+    buf = _DENSE_ROW_BASE.get(key)
+    if buf is None:
+        buf = torch.arange(num_seqs, device=device, dtype=torch.int32) * int(query_length)
+        _DENSE_ROW_BASE[key] = buf
+    return buf
+
+
 def _flydsl_pointer_dtype(dtype: torch.dtype):
     return {
         torch.float32: fx.Float32,
@@ -70,6 +83,11 @@ def launch_pa_decode_ps_reduce(
     max_partitions: int,
     stream: torch.cuda.Stream,
     reduce_info: torch.Tensor,
+    qo_row_base: torch.Tensor | None = None,
+    indirect: int = 0,
+    batch_size: int | None = None,
+    kv_head_count: int | None = None,
+    ragged_rows: bool = False,
 ) -> None:
     """Reduce packed partials; every sequence has at most ``max_partitions``."""
     props = torch.cuda.get_device_properties(output.device)
@@ -82,7 +100,16 @@ def launch_pa_decode_ps_reduce(
     wave = props.warp_size
     register_partitions = min(REGISTER_PARTITIONS, wave)
     max_cta_waves = 1024 // wave
-    batch, kv_heads = output.shape[0], output.shape[2]
+    batch = output.shape[0] if batch_size is None else batch_size
+    kv_heads = output.shape[2] if kv_head_count is None else kv_head_count
+    if indirect:
+        need = batch + (1 if ragged_rows else 0)
+        if qo_row_base is None or qo_row_base.shape[0] < need:
+            raise ValueError("packed reduce requires qo_row_base covering the batch")
+    elif qo_row_base is None:
+        # The reducer addresses both sides of the packed/dense select, so a
+        # dense call still needs a live base. Uniform pa_decode passes one.
+        qo_row_base = _dense_row_base(batch, query_seq_len, output.device)
     rows = query_seq_len * query_group_size
     # Exact bounds keep the register ladder short; above a wave a power of two
     # bounds the specialization count. Per-sequence buffer bounds zero-fill
@@ -165,6 +192,7 @@ def launch_pa_decode_ps_reduce(
         pairs=pairs,
         parallel_groups=groups,
         num_xcds=num_xcds,
+        ragged_rows=ragged_rows,
     )
     sink_ptr = (
         flyc.from_c_void_p(_flydsl_pointer_dtype(output.dtype), 0)
@@ -193,6 +221,8 @@ def launch_pa_decode_ps_reduce(
         ptr_arg(reduce_info, fx.Int32),
         -(-(1 << 30) // rows),
         -(-(1 << 30) // (rows * kv_heads)),
+        ptr_arg(qo_row_base, fx.Int32),
+        int(indirect),
         stream,
     )
 
@@ -386,6 +416,8 @@ def _pa_decode_mxfp4(
             query.stride(1),
             ptr_arg(context_lengths if direct else work_plan.work_info, fx.Int32),
             capacity,
+            ptr_arg(_dense_row_base(num_seqs, 1, dev), fx.Int32),
+            0,
             stream,
         )
         if direct:
@@ -436,6 +468,8 @@ def pa_decode(
     sliding_window: int = 0,
     work_plan: PADecodePlan | None = None,
     max_context_length: int | None = None,
+    qo_row_base: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
     mask_unowned_kv: bool = True,
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
@@ -627,11 +661,28 @@ def pa_decode(
 
     num_seqs = context_lengths.shape[0]
     total_q_rows, num_q_heads, head_dim = query.shape
+    ragged = qo_indptr is not None
+    if ragged:
+        if qo_row_base is not None:
+            raise ValueError("ragged pa_decode takes qo_indptr, not qo_row_base")
+        qo_row_base = qo_indptr
+    packed_qo = qo_row_base is not None
+    if packed_qo:
+        if qo_row_base.dtype != torch.int32 or qo_row_base.ndim != 1:
+            raise TypeError("qo_row_base must be a 1D int32 tensor")
+        expect = num_seqs + 1 if ragged else num_seqs
+        if qo_row_base.shape[0] != expect or not qo_row_base.is_contiguous():
+            raise ValueError(
+                "qo_row_base must be a contiguous int32 vector of length "
+                f"{expect}, got {tuple(qo_row_base.shape)}"
+            )
+        if qo_row_base.device != query.device:
+            raise ValueError("qo_row_base must be on the query device")
     if query.device.type != "cuda":
         raise ValueError(f"query must be on a CUDA device, got {query.device}")
     if num_q_heads < 1:
         raise ValueError(f"query must contain at least one head, got {num_q_heads}")
-    if total_q_rows != num_seqs * query_length:
+    if not packed_qo and total_q_rows != num_seqs * query_length:
         raise ValueError(
             f"query.shape[0] ({total_q_rows}) must equal "
             f"context_lengths.shape[0] * query_length ({num_seqs} * {query_length})"
@@ -1015,6 +1066,7 @@ def pa_decode(
             sliding_window=sliding_window,
             direct_output=direct_output,
             trans_k=trans_k,
+            ragged_tiles=ragged,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
         )
@@ -1072,6 +1124,18 @@ def pa_decode(
             )
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
+    row_base_buf = (
+        qo_row_base if packed_qo else _dense_row_base(num_seqs, query_length, dev)
+    )
+    qo_indirect_flag = 1 if packed_qo else 0
+    if packed_qo and arch in ("gfx1250", "gfx1250-strict"):
+        raise NotImplementedError("qo_row_base packing is implemented on gfx942/gfx950")
+    packed_tile_args = ()
+    if arch not in ("gfx1250", "gfx1250-strict"):
+        packed_tile_args = (
+            ptr_arg(row_base_buf, fx.Int32),
+            int(qo_indirect_flag),
+        )
     merge_args = ()
     if arch in ("gfx1250", "gfx1250-strict"):
         merged = direct_output and not one_partition_output
@@ -1121,10 +1185,43 @@ def pa_decode(
             int(query.stride(1)),
             ptr_arg(work_plan.work_info, fx.Int32),
             work_plan.capacity,
+            *packed_tile_args,
             *merge_args,
             s,
         )
         if direct_output or cluster_merge:
+            return
+        if packed_qo:
+            output_packed = output.view(
+                output.shape[0], num_kv_heads, query_group_size, head_dim
+            )
+            launch_pa_decode_ps_reduce(
+                output_packed,
+                psum,
+                pmax,
+                pout,
+                sinks,
+                0,
+                int(output_packed.stride(0)),
+                int(output_packed.stride(1)),
+                int(output_packed.stride(2)),
+                pmax.stride(0),
+                pmax.stride(1),
+                pout.stride(0),
+                pout.stride(1),
+                pout.stride(2),
+                query_seq_len=query_length,
+                query_group_size=query_group_size,
+                head_size=head_dim,
+                max_partitions=max_partitions,
+                stream=s,
+                reduce_info=work_plan.reduce_info,
+                qo_row_base=row_base_buf,
+                indirect=1,
+                batch_size=num_seqs,
+                kv_head_count=num_kv_heads,
+                ragged_rows=ragged,
+            )
             return
         output_5d = output.reshape(
             num_seqs, query_length, num_kv_heads, query_group_size, head_dim
@@ -1150,4 +1247,64 @@ def pa_decode(
             max_partitions=max_partitions,
             stream=s,
             reduce_info=work_plan.reduce_info,
+            qo_row_base=row_base_buf,
+            indirect=0,
         )
+
+
+def pa_decode_ragged(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    context_lengths: torch.Tensor,
+    block_tables: torch.Tensor,
+    softmax_scale: float,
+    qo_indptr: torch.Tensor,
+    *,
+    max_query_length: int = 8,
+    work_plan: PADecodePlan,
+    max_context_length: int | None = None,
+    exp_sums: torch.Tensor = None,
+    max_logits: torch.Tensor = None,
+    temporary_output: torch.Tensor = None,
+    sliding_window: int = 0,
+) -> None:
+    """One plan, one tile, and one reduce for mixed query widths.
+
+    ``qo_indptr`` is int32 ``[num_seqs + 1]``. Sequence ``s`` has width
+    ``qo_indptr[s + 1] - qo_indptr[s]`` in ``1 .. max_query_length`` and reads
+    Q / writes O at packed row ``qo_indptr[s] + j``. The causal window matches
+    uniform ``pa_decode`` at that width: query ``j`` sees through
+    ``context_len - width + j``. Grids and scratch are fixed by ``num_seqs``
+    and ``max_query_length``, so a captured graph can replay a new histogram
+    from these device tensors.
+
+    Widths share one KV pass. An MFMA tile is 16 query-rows. With GQA 6 and
+    ``max_query_length`` 8 a sequence runs 1, 2, or 3 tiles: a tile whose first
+    query ``(m * 16) // group`` is past the width is skipped. Both arms of that
+    runtime branch return the score list and the PV accumulator state. Q for
+    every M-tile stays in LDS; the K loop reloads one tile so a short sequence
+    does not hold the width-8 Q operand set. Rows past the width inside a live
+    tile still share that tile's 16-row MFMA and are dropped by the reducer.
+    Uniform ``pa_decode`` is a separate specialization and does not take this path.
+    """
+    if not isinstance(max_query_length, int) or max_query_length < 1:
+        raise ValueError("max_query_length must be a positive int")
+    pa_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        softmax_scale,
+        max_query_length,
+        work_plan=work_plan,
+        max_context_length=max_context_length,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
+        sliding_window=sliding_window,
+        qo_indptr=qo_indptr,
+    )

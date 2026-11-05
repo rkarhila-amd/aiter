@@ -485,6 +485,9 @@ class PaDecodeTraits:
     sVScaleMax_off: int
     sPages_off: int
     total_bytes: int
+    # Ragged keeps every M-tile of Q here so the K loop reloads one tile at a
+    # time. Uniform pa_decode leaves this at 0 and keeps the Q/P alias.
+    sQkeep_off: int = 0
 
     def o_slot(self, m: int, vh: int) -> int:
         return 2 + self.STATE_PER_M * m + vh
