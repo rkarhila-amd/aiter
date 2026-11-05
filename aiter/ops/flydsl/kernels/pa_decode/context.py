@@ -37,6 +37,10 @@ class PaDecodeContext:
         planned_start,
         planned_end,
         planned_context,
+        qo_row_base_ptr=None,
+        qo_indirect=None,
+        ragged_tiles=False,
+        bidirectional=False,
     ):
         self.traits = traits
         self.shared_storage = shared_storage
@@ -59,6 +63,25 @@ class PaDecodeContext:
         self.planned_start = planned_start
         self.planned_end = planned_end
         self.planned_context = planned_context
+        # qo_indirect selects packed-row Q loads. The pointer stays live either way
+        # so the select does not read a null base.
+        self.qo_row_base_ptr = qo_row_base_ptr
+        self.qo_indirect = qo_indirect
+        # Host bool, baked into this specialization. When set, qo_row_base_ptr is
+        # qo_indptr of length num_seqs+1 and each sequence has its own width.
+        self.ragged_tiles = bool(ragged_tiles)
+        # Host bool, baked into this specialization. Live rows use causal
+        # offset 0 so each query sees the full context length. Separate from
+        # the causal ragged specialization so a draft graph does not reuse it.
+        self.bidirectional = bool(bidirectional)
+        self.qlen = None
+
+    def init_query_length(self):
+        """Per-sequence width. Uniform specializations never call this."""
+        indptr = fx.recast_iter(fx.Int32, self.qo_row_base_ptr)
+        nxt = fx.Int32(indptr[self.seq + fx.Int32(1)])
+        cur = fx.Int32(indptr[self.seq])
+        self.qlen = nxt - cur
 
     def init_thread_mapping(self):
         """Resolve the physical grid to a sequence, KV head and partial slot."""
@@ -121,6 +144,24 @@ class PaDecodeContext:
 
     def init_causal_offsets(self):
         # Distance to the newest query keeps causal bounds tile-relative.
+        if const_expr(self.ragged_tiles):
+            if const_expr(self.bidirectional):
+                # Every live query attends through the full context length.
+                # Past-width rows are still dropped by the reducer.
+                self.causal_offset = [
+                    fx.Int32(0) for _m in range_constexpr(self.traits.M_TILES)
+                ]
+                return
+            # Live rows use width-1-j, matching uniform pa_decode at that width.
+            # Rows past the width reuse the last live query and are not stored.
+            offsets = []
+            for m in range_constexpr(self.traits.M_TILES):
+                j = (m * MFMA_MNK + self.lane16) // self.traits.query_group_size
+                last = self.qlen - fx.Int32(1)
+                j_use = (j < self.qlen).select(j, last)
+                offsets.append(self.qlen - fx.Int32(1) - self.query_begin - j_use)
+            self.causal_offset = offsets
+            return
         if const_expr(self.traits.QUERIES_PER_CTA == 1):
             self.causal_offset = [
                 self.traits.query_length - 1 - self.query_begin

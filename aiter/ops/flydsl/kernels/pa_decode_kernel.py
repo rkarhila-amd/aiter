@@ -56,6 +56,8 @@ and LDS movement, MFMA/WMMA, softmax and output operations.
 this module keeps the compilation API and launch wrappers.
 """
 
+from dataclasses import replace
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
@@ -125,6 +127,8 @@ def _pa_decode_tile_kernel_name(
     sliding_window,
     query_splits,
     direct_output=False,
+    ragged_tiles=False,
+    bidirectional=False,
     stage_pages=0,
     merge_partitions=False,
     cluster_merge=0,
@@ -144,6 +148,10 @@ def _pa_decode_tile_kernel_name(
         name += f"_qs{query_splits}"
     if direct_output:
         name += "_direct"
+    if ragged_tiles:
+        name += "_ragged"
+    if bidirectional:
+        name += "_bidir"
     if stage_pages:
         name += f"_pages{stage_pages}"
     if merge_partitions:
@@ -177,6 +185,8 @@ def compile_pa_decode_tile(
     sliding_window: int = 0,
     direct_output: bool = False,
     trans_k: bool = True,
+    ragged_tiles: bool = False,
+    bidirectional: bool = False,
     mask_unowned_kv: bool = True,
     cluster_merge: int = 0,
 ):
@@ -295,14 +305,39 @@ def compile_pa_decode_tile(
         mask_unowned_kv=mask_unowned_kv,
         direct_output=direct_output,
     )
-    cached = _PA_DECODE_TILE_CACHE.get(schedule.cache_key)
+    if bidirectional and not ragged_tiles:
+        raise ValueError("bidirectional pa_decode requires ragged_tiles")
+    cache_id = (schedule.cache_key, bool(ragged_tiles), bool(bidirectional))
+    cached = _PA_DECODE_TILE_CACHE.get(cache_id)
     if cached is not None:
         return cached
 
     traits = PaDecodeTraits.create(schedule)
+    if ragged_tiles:
+        # Q stays live for every KV tile. Holding all M-tiles in VGPRs is the
+        # width-8 register set. Park Q past the aliased Q/P region and reload
+        # one M-tile inside the K loop. 16-row masked tails still share the
+        # MFMA with the live rows of that tile; gfx942 has no smaller BF16 atom.
+        q_bytes = traits.M_TILES * MFMA_MNK * traits.head_dim * traits.QP_ELEM_BYTES
+        qkeep = (traits.total_bytes + 15) & ~15
+        lds_bytes = qkeep + q_bytes
+        if lds_bytes > 64 * 1024:
+            raise RuntimeError(
+                f"ragged persistent Q needs {lds_bytes} LDS bytes, above 64 KiB"
+            )
+        traits = replace(traits, sQkeep_off=qkeep, total_bytes=lds_bytes)
     # As in fmha_gfx950, expose scalar specialization data to FlyDSL's closure
     # cache walker: it cannot inspect the fields of a captured traits object.
-    _pa_decode_cache_tag = (traits.cache_key, implementation_cache_tag())
+    # The non-bidirectional tag stays the pair the causal kernel already
+    # caches. A third element would miss that cache and recompile it.
+    if bidirectional:
+        _pa_decode_cache_tag = (
+            traits.cache_key,
+            "bidir",
+            implementation_cache_tag(),
+        )
+    else:
+        _pa_decode_cache_tag = (traits.cache_key, implementation_cache_tag())
 
     @fx.struct
     class SharedStorage:
@@ -330,6 +365,8 @@ def compile_pa_decode_tile(
         planned_start: fx.Int32,
         planned_end: fx.Int32,
         planned_context: fx.Int32,
+        qo_row_base_ptr: fx.Pointer,
+        qo_indirect: fx.Int32,
     ):
         _ = _pa_decode_cache_tag
         ctx = PaDecodeContext(
@@ -354,6 +391,10 @@ def compile_pa_decode_tile(
             planned_start,
             planned_end,
             planned_context,
+            qo_row_base_ptr,
+            qo_indirect,
+            ragged_tiles=ragged_tiles,
+            bidirectional=bidirectional,
         )
         PaDecodePipeline(ctx).run()
 
@@ -368,6 +409,8 @@ def compile_pa_decode_tile(
         trans_v=traits.trans_v,
         sliding_window=traits.sliding_window,
         query_splits=traits.query_splits,
+        ragged_tiles=ragged_tiles,
+        bidirectional=bidirectional,
         direct_output=traits.DIRECT,
         stage_pages=traits.stage_page_capacity if traits.MXFP4 else 0,
     )
@@ -390,6 +433,8 @@ def compile_pa_decode_tile(
         stride_q_head: fx.Int32,
         work_info_ptr: fx.Pointer,
         num_sequences: fx.Int32,
+        qo_row_base_ptr: fx.Pointer,
+        qo_indirect: fx.Int32,
     ):
         def _run_task(seq, start, end, context):
             _pa_decode_tile_task(
@@ -412,6 +457,8 @@ def compile_pa_decode_tile(
                 start,
                 end,
                 context,
+                qo_row_base_ptr,
+                qo_indirect,
             )
 
         # Skip cleared padding records: no scratch writes or Q loads.
@@ -476,6 +523,8 @@ def compile_pa_decode_tile(
         stride_q_head: fx.Int32,
         work_info: fx.Pointer,
         work_capacity: fx.Int32,
+        qo_row_base: fx.Pointer,
+        qo_indirect: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         _ = _pa_decode_cache_tag
@@ -498,6 +547,8 @@ def compile_pa_decode_tile(
                 stride_q_head,
                 work_info,
                 num_seqs,
+                qo_row_base,
+                qo_indirect,
             ).launch(
                 grid=(
                     (
@@ -520,7 +571,7 @@ def compile_pa_decode_tile(
         "launch": pa_decode_tile_launch,
         "kernel": pa_decode_tile_kernel,
     }
-    return _PA_DECODE_TILE_CACHE.setdefault(traits.cache_key, compiled)
+    return _PA_DECODE_TILE_CACHE.setdefault(cache_id, compiled)
 
 
 def compile_gfx1250_pa_decode(

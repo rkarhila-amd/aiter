@@ -96,6 +96,33 @@ class PaDecodeGemm:
             frag_Ss.append(fx.Vector(acc))
         return frag_Ss
 
+    def qk_chunk_interleaved(self, k_ops, q_ops):
+        """QK for one M-tile, with the token-chunk MFMA chains lockstepped.
+
+        The four chunks do not depend on each other. Issuing one K-pack of
+        each chain before the next pack keeps a single K tile and a single Q
+        tile live, and gives the MFMA pipe another chain while an accumulator
+        is in flight. Uniform ``qk`` stays a serial chain.
+        """
+        if const_expr(not self.traits.is_bf16_kv):
+            return self.qk(k_ops, q_ops, 0)
+        accs = [
+            fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32)
+            for _a in range_constexpr(self.traits.NCHUNK)
+        ]
+        for pack in range_constexpr(self.traits.N_SUBCHUNKS):
+            b_pack = fx.Vector.from_elements([q_ops[pack]], dtype=fx.Int64).bitcast(
+                fx.Int16
+            )
+            for a in range_constexpr(self.traits.NCHUNK):
+                a_pack = fx.Vector.from_elements(
+                    [k_ops[a * self.traits.N_SUBCHUNKS + pack]], dtype=fx.Int64
+                ).bitcast(fx.Int16)
+                accs[a] = fx.rocdl.mfma_f32_16x16x16bf16_1k(
+                    T.f32x4, [a_pack, b_pack, accs[a], 0, 0, 0]
+                )
+        return [fx.Vector(accs[a]) for a in range_constexpr(self.traits.NCHUNK)]
+
     def qk_mxfp4(self, k_raw, k_scales, q_op, q_scale_byte):
         """QK of one MXFP4 K tile: per 16-token chunk one scaled MFMA, A = packed
         E2M1 K (lane: 16 B = one E8M0 group, its scale byte), B = E4M3 Q (``q_op``)
@@ -129,6 +156,29 @@ class PaDecodeGemm:
         acc = fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32)
         acc = self.mfma(v_ops, p_ops, 0, 0, self.traits.NVOPS, acc)
         return fx.Vector(acc)
+
+    def pv_vh_interleaved(self, v_chunks, p_ops):
+        """PV for every head-dim chunk of one M-tile, MFMA chains lockstepped.
+
+        Each chunk has its own accumulator and its own V operand. P is shared.
+        The V tile is already live; this does not reload it.
+        """
+        accs = [
+            fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32)
+            for _vh in range_constexpr(self.traits.VHE_CHUNKS)
+        ]
+        for pack in range_constexpr(self.traits.NVOPS):
+            b_pack = fx.Vector.from_elements([p_ops[pack]], dtype=fx.Int64).bitcast(
+                fx.Int16
+            )
+            for vh in range_constexpr(self.traits.VHE_CHUNKS):
+                a_pack = fx.Vector.from_elements(
+                    [v_chunks[vh][pack]], dtype=fx.Int64
+                ).bitcast(fx.Int16)
+                accs[vh] = fx.rocdl.mfma_f32_16x16x16bf16_1k(
+                    T.f32x4, [a_pack, b_pack, accs[vh], 0, 0, 0]
+                )
+        return [fx.Vector(accs[vh]) for vh in range_constexpr(self.traits.VHE_CHUNKS)]
 
 
 class Gfx1250Gemm:

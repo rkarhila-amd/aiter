@@ -122,8 +122,24 @@ class PaDecodeQueryLoader:
     def load_row(self, qi, gs_head):
         qh0 = self.ctx.kv_h * self.traits.query_group_size + gs_head
         qb = 1 if self.traits.Q_IN_DTYPE == self.traits.FP8 else 2
+        # Packed rows: qo_row_base[seq] is the packed index of query position 0.
+        # Dense rows stay seq * query_length. Both sides of the select are
+        # addressed so a null base is never the indirect=0 pointer.
+        row_bases = fx.recast_iter(fx.Int32, self.ctx.qo_row_base_ptr)
+        loaded = fx.Int32(row_bases[self.ctx.seq])
+        dense = self.ctx.seq * self.traits.query_length
+        use_packed = self.ctx.qo_indirect != fx.Int32(0)
+        row0 = use_packed.select(loaded, dense)
+        qi_use = qi
+        if const_expr(self.ctx.ragged_tiles):
+            # Clamp past-width rows onto the last live query so the address
+            # stays inside this sequence. The reducer does not store them.
+            abs_qi = self.ctx.query_begin + qi
+            last = self.ctx.qlen - fx.Int32(1)
+            abs_use = (abs_qi < self.ctx.qlen).select(abs_qi, last)
+            qi_use = abs_use - self.ctx.query_begin
         row_byte0 = (
-            (self.ctx.seq * self.traits.query_length + self.ctx.query_begin + qi)
+            (row0 + self.ctx.query_begin + qi_use)
             * self.ctx.stride_q_row
             + qh0 * self.ctx.stride_q_head
         ) * qb
@@ -232,7 +248,10 @@ class PaDecodeQueryLoader:
             flat_idx = m * MFMA_MNK + self.ctx.qh_local
             qi = flat_idx // self.traits.query_group_size
             gs_head = flat_idx - qi * self.traits.query_group_size
-            q_row_off = m * MFMA_MNK * self.traits.head_dim * self.traits.QP_ELEM_BYTES
+            q_row_off = (
+                self.traits.sQkeep_off
+                + m * MFMA_MNK * self.traits.head_dim * self.traits.QP_ELEM_BYTES
+            )
             # Only the final M-tile can need a runtime row guard.
             if const_expr((m + 1) * MFMA_MNK <= self.traits.CTA_ROWS):
                 q_units = (
@@ -276,22 +295,31 @@ class PaDecodeQueryLoader:
         # Match the head-dim permutation of PaDecodeKVLoader.load_k_chunk.
         q_ops_all = []
         for m in range_constexpr(self.traits.M_TILES):
-            q_row_off = m * MFMA_MNK * self.traits.head_dim * self.traits.QP_ELEM_BYTES
-            for qkhe in range_constexpr(self.traits.QKHE_LOOP):
-                he_idx = qkhe * self.traits.RGROUP_QUARTERS + self.ctx.rgroup
-                chunk = self.lds.load(
-                    q_row_off
-                    + (
-                        self.ctx.lane16 * self.traits.head_dim
-                        + he_idx * self.traits.QK_CHUNK_ELEMS
-                    )
-                    * self.traits.QP_ELEM_BYTES,
-                    fx.Int64,
-                    4 if self.traits.is_bf16_kv else 2,
-                )
-                for qkr in range_constexpr(4 if self.traits.is_bf16_kv else 2):
-                    q_ops_all.append(chunk[qkr])
+            q_ops_all.extend(self.load_q_tile(m))
         return q_ops_all
+
+    def load_q_tile(self, m):
+        """MFMA Q operand for one M-tile. Ragged reloads this from sQkeep."""
+        q_row_off = (
+            self.traits.sQkeep_off
+            + m * MFMA_MNK * self.traits.head_dim * self.traits.QP_ELEM_BYTES
+        )
+        q_ops = []
+        for qkhe in range_constexpr(self.traits.QKHE_LOOP):
+            he_idx = qkhe * self.traits.RGROUP_QUARTERS + self.ctx.rgroup
+            chunk = self.lds.load(
+                q_row_off
+                + (
+                    self.ctx.lane16 * self.traits.head_dim
+                    + he_idx * self.traits.QK_CHUNK_ELEMS
+                )
+                * self.traits.QP_ELEM_BYTES,
+                fx.Int64,
+                4 if self.traits.is_bf16_kv else 2,
+            )
+            for qkr in range_constexpr(4 if self.traits.is_bf16_kv else 2):
+                q_ops.append(chunk[qkr])
+        return q_ops
 
     def _load_operands_mxfp4(self):
         """B operand of the scaled MFMA: head ``lane16``, bytes 16*rgroup..+15 and

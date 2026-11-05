@@ -20,7 +20,14 @@ from .op_gemm import Gfx1250Gemm, PaDecodeGemm
 from .op_lds import Gfx1250Memory, PaDecodeKVLoader, PaDecodeLds, PaDecodeQueryLoader
 from .op_merge import Gfx1250PartitionMerge
 from .op_softmax import PaDecodeSoftmax
-from .traits import KV_COMPUTE_BLOCK, LOG2E, MFMA_MNK, MXFP4_P_EXP_SHIFT, WAVE
+from .traits import (
+    KV_COMPUTE_BLOCK,
+    LOG2E,
+    MFMA_ACC_ELEMS,
+    MFMA_MNK,
+    MXFP4_P_EXP_SHIFT,
+    WAVE,
+)
 
 
 class PaDecodePipeline:
@@ -38,6 +45,11 @@ class PaDecodePipeline:
     def run(self):
         """Initialize resources in load order, then compute and store one CTA."""
         self.ctx.init_thread_mapping()
+        if const_expr(self.ctx.ragged_tiles):
+            self.ctx.init_query_length()
+            # Empty widths write no partials. The reducer skips those rows.
+            if self.ctx.qlen <= fx.Int32(0):
+                return
         self.epilogue.init_outputs()
         self.kv.init_loaders()
         self.query.init_loaders()
@@ -60,7 +72,12 @@ class PaDecodePipeline:
         gpu.barrier()
         if const_expr(not self.traits.MXFP4):
             v_page_pf0 = self.kv.read_v_pages()
-        q_ops_all = self.query.load_operands()
+        # Ragged Q lives in sQkeep for the whole K loop. Loading every M-tile
+        # here would put the width-8 operand set back into loop-invariant VGPRs.
+        if const_expr(self.ctx.ragged_tiles):
+            q_ops_all = [fx.Int64(0)]
+        else:
+            q_ops_all = self.query.load_operands()
         self.softmax.init_mask()
         self.ctx.init_causal_offsets()
         o_final = self.mainloop(k_pf0, v_page_pf0, q_ops_all)
@@ -211,6 +228,99 @@ class PaDecodePipeline:
         )
 
     @flyc.jit
+    def _ragged_pv_m(
+        self,
+        m,
+        ostate,
+        masked_chunks_saved,
+        v_scale_shared,
+        cur_kv_buf,
+        v_vh_shared,
+        tile_valid,
+        mask_tail,
+    ):
+        """PV and online-softmax update for one live ragged M-tile.
+
+        Head-dim chunks are independent, so their MFMA chains are
+        lockstepped on the V tile that is already live. Uniform pa_decode
+        does not call this. The last KV tile still masks V rows past the
+        context, matching the peeled uniform tile.
+        """
+        p_base = (
+            self.traits.sP_off
+            + (m % self.traits.P_BUFFERS) * MFMA_MNK * self.traits.SP_ROW_BYTES
+        )
+        lsum_base = (
+            self.traits.sLsum_off
+            + (m % self.traits.P_BUFFERS)
+            * MFMA_MNK
+            * self.traits.NWARP_PAD
+            * self.traits.f32
+        )
+        o_acc = [
+            ostate[self.traits.o_slot(m, vh)]
+            for vh in range_constexpr(self.traits.VHE_CHUNKS)
+        ]
+        m_prev = ostate[self.traits.m_slot(m)]
+        l_prev = ostate[self.traits.l_slot(m)]
+        masked_chunks = masked_chunks_saved[m]
+        v_max_scaled = None
+        norm_factor_b = None
+        if const_expr(self.traits.per_token_kv):
+            v_max_scaled, norm_factor_b = self.softmax.v_scale_normalization()
+        m_new, corr_reg = self.softmax.pack_multi(
+            masked_chunks,
+            m,
+            m_prev,
+            p_base,
+            lsum_base,
+            v_scale_shared,
+            cur_kv_buf,
+            norm_factor_b,
+        )
+        gpu.barrier()
+        gsum = self.lds.load_wave(lsum_base, self.ctx.lane16).reduce(ReductionOp.ADD)
+        l_new = (
+            gsum
+            if const_expr(self.traits.single_tile_plan)
+            else l_prev * corr_reg + gsum
+        )
+        p_ops = self.lds.load(
+            p_base
+            + self.ctx.lane16 * self.traits.SP_ROW_BYTES
+            + self.ctx.rgroup * 64 * self.traits.QP_ELEM_BYTES,
+            fx.Int64,
+            self.traits.NVOPS,
+        )
+        corr_b = fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg), fx.Float32)
+        if const_expr(
+            self.traits.is_bf16_kv and not self.traits.per_token_kv
+        ):
+            ops = self.gemm.pv_vh_interleaved(v_vh_shared, p_ops)
+            for vh in range_constexpr(self.traits.VHE_CHUNKS):
+                o_acc[vh] = (
+                    ops[vh]
+                    if const_expr(self.traits.single_tile_plan)
+                    else o_acc[vh] * corr_b + ops[vh]
+                )
+        else:
+            for vh in range_constexpr(self.traits.VHE_CHUNKS):
+                v_vh = v_vh_shared[vh]
+                op = self.gemm.pv(v_vh, p_ops)
+                if const_expr(self.traits.per_token_kv):
+                    op = op * fx.full(self.traits.OP_ELEMS, v_max_scaled, fx.Float32)
+                o_acc[vh] = (
+                    op
+                    if const_expr(self.traits.single_tile_plan)
+                    else o_acc[vh] * corr_b + op
+                )
+        if const_expr(m < self.traits.M_TILES - 1):
+            if const_expr(self.traits.P_BUFFERS == 1):
+                gpu.barrier()
+            fx.rocdl.sched_barrier(0)
+        return [*o_acc, m_new, l_new]
+
+    @flyc.jit
     def multi_query_tile(
         self,
         ostate,
@@ -244,20 +354,58 @@ class PaDecodePipeline:
             ]
 
         for m in range_constexpr(self.traits.M_TILES):
-            frag_Ss = self.gemm.qk(k_cur, q_ops_all, m)
+            # Ragged mode skips an M-tile whose first query is past the width.
+            # The tile is 16 rows. With GQA 6 and query_splits 1 that query is
+            # (m*16)//6, so widths 1-2 run 1 tile, 3-5 run 2, and 6-8 run 3.
+            # scf.if cannot yield a variable that was None on entry, so the
+            # score list is a real -inf vector list before the branch and both
+            # sides assign that same list shape. Uniform pa_decode leaves the
+            # tile unconditional.
+            if const_expr(self.ctx.ragged_tiles):
+                first_q = (m * MFMA_MNK) // self.traits.query_group_size
+                masked_chunks = [
+                    fx.full(MFMA_ACC_ELEMS, float("-inf"), fx.Float32)
+                    for _a in range_constexpr(self.traits.NCHUNK)
+                ]
+                if fx.Int32(first_q) < self.ctx.qlen:
+                    # One M-tile of Q. The sched barrier is after this tile's
+                    # scores so the next reload does not overlap this Q set.
+                    q_tile = self.query.load_q_tile(m)
+                    # Token chunks of this tile are independent. Interleave
+                    # their MFMA chains. K and V stay the carried one-tile set.
+                    frag_Ss = self.gemm.qk_chunk_interleaved(k_cur, q_tile)
+                    scale = (
+                        self.ctx.scale_qk
+                        if const_expr(self.traits.is_bf16_kv)
+                        else self.ctx.scale_qk * fx.Float32(q_scale_vec[m])
+                    )
+                    masked_chunks = self.softmax.multi_scores(
+                        frag_Ss, scale, k_scale_shared, tile_valid, window_left, m
+                    )
+                    self.softmax.stage_row_max(
+                        masked_chunks, self.softmax.lmax_offset(m), scale, True
+                    )
+                    fx.rocdl.sched_barrier(0)
+                else:
+                    masked_chunks = [
+                        fx.full(MFMA_ACC_ELEMS, float("-inf"), fx.Float32)
+                        for _a in range_constexpr(self.traits.NCHUNK)
+                    ]
+            else:
+                frag_Ss = self.gemm.qk(k_cur, q_ops_all, m)
 
-            scale = (
-                self.ctx.scale_qk
-                if const_expr(self.traits.is_bf16_kv)
-                else self.ctx.scale_qk * fx.Float32(q_scale_vec[m])
-            )
-            masked_chunks = self.softmax.multi_scores(
-                frag_Ss, scale, k_scale_shared, tile_valid, window_left, m
-            )
+                scale = (
+                    self.ctx.scale_qk
+                    if const_expr(self.traits.is_bf16_kv)
+                    else self.ctx.scale_qk * fx.Float32(q_scale_vec[m])
+                )
+                masked_chunks = self.softmax.multi_scores(
+                    frag_Ss, scale, k_scale_shared, tile_valid, window_left, m
+                )
 
-            self.softmax.stage_row_max(
-                masked_chunks, self.softmax.lmax_offset(m), scale, True
-            )
+                self.softmax.stage_row_max(
+                    masked_chunks, self.softmax.lmax_offset(m), scale, True
+                )
 
             masked_chunks_saved[m] = masked_chunks
 
@@ -407,90 +555,138 @@ class PaDecodePipeline:
                     )
         else:
             for m in range_constexpr(self.traits.M_TILES):
-                p_base = (
-                    self.traits.sP_off
-                    + (m % self.traits.P_BUFFERS) * MFMA_MNK * self.traits.SP_ROW_BYTES
-                )
-                lsum_base = (
-                    self.traits.sLsum_off
-                    + (m % self.traits.P_BUFFERS)
-                    * MFMA_MNK
-                    * self.traits.NWARP_PAD
-                    * self.traits.f32
-                )
-                o_acc = [
-                    ostate[self.traits.o_slot(m, vh)]
-                    for vh in range_constexpr(self.traits.VHE_CHUNKS)
-                ]
-                m_prev = ostate[
-                    self.traits.m_slot(m)
-                ]  # this thread's own running max, carried from last tile
-                l_prev = ostate[
-                    self.traits.l_slot(m)
-                ]  # this thread's own running denom, carried from last tile
-
-                masked_chunks = masked_chunks_saved[m]
-
-                v_max_scaled = None
-                norm_factor_b = None
-                if const_expr(self.traits.per_token_kv):
-                    v_max_scaled, norm_factor_b = self.softmax.v_scale_normalization()
-
-                m_new, corr_reg = self.softmax.pack_multi(
-                    masked_chunks,
-                    m,
-                    m_prev,
-                    p_base,
-                    lsum_base,
-                    v_scale_shared,
-                    cur_kv_buf,
-                    norm_factor_b,
-                )
-                gpu.barrier()
-                gsum = self.lds.load_wave(lsum_base, self.ctx.lane16).reduce(
-                    ReductionOp.ADD
-                )
-                l_new = (
-                    gsum
-                    if const_expr(self.traits.single_tile_plan)
-                    else l_prev * corr_reg + gsum
-                )
-
-                p_ops = self.lds.load(
-                    p_base
-                    + self.ctx.lane16 * self.traits.SP_ROW_BYTES
-                    + self.ctx.rgroup * 64 * self.traits.QP_ELEM_BYTES,
-                    fx.Int64,
-                    self.traits.NVOPS,
-                )
-
-                corr_b = fx.full(self.traits.OP_ELEMS, fx.Float32(corr_reg), fx.Float32)
-                if const_expr(mask_tail and m == 0):
-                    v_masks = self.kv.tail_masks(tile_valid)
-                for vh in range_constexpr(self.traits.VHE_CHUNKS):
+                # Same predicate as the score loop. The idle arm returns the
+                # carried accumulator, max, and denominator. qlen is one value
+                # for the whole CTA, so the live arm's barrier is uniform.
+                # Uniform pa_decode keeps the inlined body, including the
+                # last-tile V tail mask.
+                if const_expr(self.ctx.ragged_tiles):
+                    # Mask before the runtime width test. The masked V values
+                    # are reused by later M-tiles, so they must dominate the
+                    # scf.if. Width 0 already returned; m == 0 is live.
                     if const_expr(mask_tail and m == 0):
-                        v_vh_shared[vh] = self.kv.mask_v_chunk(
-                            v_vh_shared[vh], v_masks, tile_valid
+                        v_masks = self.kv.tail_masks(tile_valid)
+                        for vh in range_constexpr(self.traits.VHE_CHUNKS):
+                            v_vh_shared[vh] = self.kv.mask_v_chunk(
+                                v_vh_shared[vh], v_masks, tile_valid
+                            )
+                    first_q = (m * MFMA_MNK) // self.traits.query_group_size
+                    carried = [
+                        ostate[self.traits.o_slot(m, vh)]
+                        for vh in range_constexpr(self.traits.VHE_CHUNKS)
+                    ]
+                    carried.append(ostate[self.traits.m_slot(m)])
+                    carried.append(ostate[self.traits.l_slot(m)])
+                    if fx.Int32(first_q) < self.ctx.qlen:
+                        carried = self._ragged_pv_m(
+                            m,
+                            ostate,
+                            masked_chunks_saved,
+                            v_scale_shared,
+                            cur_kv_buf,
+                            v_vh_shared,
+                            tile_valid,
+                            mask_tail,
                         )
-                    v_vh = v_vh_shared[vh]
-                    op = self.gemm.pv(v_vh, p_ops)
-                    if const_expr(self.traits.per_token_kv):
-                        op = op * fx.full(
-                            self.traits.OP_ELEMS, v_max_scaled, fx.Float32
-                        )
-                    o_acc[vh] = (
-                        op
-                        if const_expr(self.traits.single_tile_plan)
-                        else o_acc[vh] * corr_b + op
+                    else:
+                        carried = [
+                            ostate[self.traits.o_slot(m, vh)]
+                            for vh in range_constexpr(self.traits.VHE_CHUNKS)
+                        ]
+                        carried.append(ostate[self.traits.m_slot(m)])
+                        carried.append(ostate[self.traits.l_slot(m)])
+                    next_state.extend(carried)
+                else:
+                    p_base = (
+                        self.traits.sP_off
+                        + (m % self.traits.P_BUFFERS)
+                        * MFMA_MNK
+                        * self.traits.SP_ROW_BYTES
                     )
-                next_state.extend([*o_acc, m_new, l_new])
-                # Single P/Lsum slots need a read-retirement barrier.
-                # Alternating slots use the next write barrier; Phase A
-                # protects loop boundaries. The fence bounds live registers.
-                if const_expr(m < self.traits.M_TILES - 1):
-                    if const_expr(self.traits.P_BUFFERS == 1):
-                        gpu.barrier()
-                    fx.rocdl.sched_barrier(0)
+                    lsum_base = (
+                        self.traits.sLsum_off
+                        + (m % self.traits.P_BUFFERS)
+                        * MFMA_MNK
+                        * self.traits.NWARP_PAD
+                        * self.traits.f32
+                    )
+                    o_acc = [
+                        ostate[self.traits.o_slot(m, vh)]
+                        for vh in range_constexpr(self.traits.VHE_CHUNKS)
+                    ]
+                    m_prev = ostate[
+                        self.traits.m_slot(m)
+                    ]  # this thread's own running max, carried from last tile
+                    l_prev = ostate[
+                        self.traits.l_slot(m)
+                    ]  # this thread's own running denom, carried from last tile
+
+                    masked_chunks = masked_chunks_saved[m]
+
+                    v_max_scaled = None
+                    norm_factor_b = None
+                    if const_expr(self.traits.per_token_kv):
+                        v_max_scaled, norm_factor_b = (
+                            self.softmax.v_scale_normalization()
+                        )
+
+                    m_new, corr_reg = self.softmax.pack_multi(
+                        masked_chunks,
+                        m,
+                        m_prev,
+                        p_base,
+                        lsum_base,
+                        v_scale_shared,
+                        cur_kv_buf,
+                        norm_factor_b,
+                    )
+                    gpu.barrier()
+                    gsum = self.lds.load_wave(lsum_base, self.ctx.lane16).reduce(
+                        ReductionOp.ADD
+                    )
+                    l_new = (
+                        gsum
+                        if const_expr(self.traits.single_tile_plan)
+                        else l_prev * corr_reg + gsum
+                    )
+
+                    p_ops = self.lds.load(
+                        p_base
+                        + self.ctx.lane16 * self.traits.SP_ROW_BYTES
+                        + self.ctx.rgroup * 64 * self.traits.QP_ELEM_BYTES,
+                        fx.Int64,
+                        self.traits.NVOPS,
+                    )
+
+                    corr_b = fx.full(
+                        self.traits.OP_ELEMS, fx.Float32(corr_reg), fx.Float32
+                    )
+                    if const_expr(mask_tail and m == 0):
+                        v_masks = self.kv.tail_masks(tile_valid)
+                    for vh in range_constexpr(self.traits.VHE_CHUNKS):
+                        if const_expr(mask_tail and m == 0):
+                            v_vh_shared[vh] = self.kv.mask_v_chunk(
+                                v_vh_shared[vh], v_masks, tile_valid
+                            )
+                        v_vh = v_vh_shared[vh]
+                        op = self.gemm.pv(v_vh, p_ops)
+                        if const_expr(self.traits.per_token_kv):
+                            op = op * fx.full(
+                                self.traits.OP_ELEMS, v_max_scaled, fx.Float32
+                            )
+                        o_acc[vh] = (
+                            op
+                            if const_expr(self.traits.single_tile_plan)
+                            else o_acc[vh] * corr_b + op
+                        )
+                    next_state.extend([*o_acc, m_new, l_new])
+                    # Single P/Lsum slots need a read-retirement barrier.
+                    # Alternating slots use the next write barrier; Phase A
+                    # protects loop boundaries. The fence bounds live registers.
+                    if const_expr(m < self.traits.M_TILES - 1):
+                        if const_expr(self.traits.P_BUFFERS == 1):
+                            gpu.barrier()
+                        fx.rocdl.sched_barrier(0)
         if const_expr(self.traits.MTP4_PREFETCH_V):
             next_state.append(v_next)
         return next_state
