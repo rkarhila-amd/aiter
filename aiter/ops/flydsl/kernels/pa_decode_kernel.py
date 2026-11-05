@@ -128,6 +128,7 @@ def _pa_decode_tile_kernel_name(
     query_splits,
     direct_output=False,
     ragged_tiles=False,
+    bidirectional=False,
     stage_pages=0,
     merge_partitions=False,
     cluster_merge=0,
@@ -149,6 +150,8 @@ def _pa_decode_tile_kernel_name(
         name += "_direct"
     if ragged_tiles:
         name += "_ragged"
+    if bidirectional:
+        name += "_bidir"
     if stage_pages:
         name += f"_pages{stage_pages}"
     if merge_partitions:
@@ -183,6 +186,7 @@ def compile_pa_decode_tile(
     direct_output: bool = False,
     trans_k: bool = True,
     ragged_tiles: bool = False,
+    bidirectional: bool = False,
     mask_unowned_kv: bool = True,
     cluster_merge: int = 0,
 ):
@@ -301,7 +305,9 @@ def compile_pa_decode_tile(
         mask_unowned_kv=mask_unowned_kv,
         direct_output=direct_output,
     )
-    cache_id = (schedule.cache_key, bool(ragged_tiles))
+    if bidirectional and not ragged_tiles:
+        raise ValueError("bidirectional pa_decode requires ragged_tiles")
+    cache_id = (schedule.cache_key, bool(ragged_tiles), bool(bidirectional))
     cached = _PA_DECODE_TILE_CACHE.get(cache_id)
     if cached is not None:
         return cached
@@ -322,7 +328,16 @@ def compile_pa_decode_tile(
         traits = replace(traits, sQkeep_off=qkeep, total_bytes=lds_bytes)
     # As in fmha_gfx950, expose scalar specialization data to FlyDSL's closure
     # cache walker: it cannot inspect the fields of a captured traits object.
-    _pa_decode_cache_tag = (traits.cache_key, implementation_cache_tag())
+    # The non-bidirectional tag stays the pair the causal kernel already
+    # caches. A third element would miss that cache and recompile it.
+    if bidirectional:
+        _pa_decode_cache_tag = (
+            traits.cache_key,
+            "bidir",
+            implementation_cache_tag(),
+        )
+    else:
+        _pa_decode_cache_tag = (traits.cache_key, implementation_cache_tag())
 
     @fx.struct
     class SharedStorage:
@@ -379,6 +394,7 @@ def compile_pa_decode_tile(
             qo_row_base_ptr,
             qo_indirect,
             ragged_tiles=ragged_tiles,
+            bidirectional=bidirectional,
         )
         PaDecodePipeline(ctx).run()
 
@@ -394,6 +410,7 @@ def compile_pa_decode_tile(
         sliding_window=traits.sliding_window,
         query_splits=traits.query_splits,
         ragged_tiles=ragged_tiles,
+        bidirectional=bidirectional,
         direct_output=traits.DIRECT,
         stage_pages=traits.stage_page_capacity if traits.MXFP4 else 0,
     )

@@ -471,6 +471,7 @@ def pa_decode(
     qo_row_base: torch.Tensor | None = None,
     qo_indptr: torch.Tensor | None = None,
     mask_unowned_kv: bool = True,
+    bidirectional: bool = False,
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
@@ -662,6 +663,8 @@ def pa_decode(
     num_seqs = context_lengths.shape[0]
     total_q_rows, num_q_heads, head_dim = query.shape
     ragged = qo_indptr is not None
+    if bidirectional and not ragged:
+        raise ValueError("bidirectional pa_decode requires qo_indptr")
     if ragged:
         if qo_row_base is not None:
             raise ValueError("ragged pa_decode takes qo_indptr, not qo_row_base")
@@ -1067,6 +1070,7 @@ def pa_decode(
             direct_output=direct_output,
             trans_k=trans_k,
             ragged_tiles=ragged,
+            bidirectional=bidirectional,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
         )
@@ -1307,4 +1311,53 @@ def pa_decode_ragged(
         temporary_output=temporary_output,
         sliding_window=sliding_window,
         qo_indptr=qo_indptr,
+    )
+
+
+def pa_decode_ragged_bidirectional(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    context_lengths: torch.Tensor,
+    block_tables: torch.Tensor,
+    softmax_scale: float,
+    qo_indptr: torch.Tensor,
+    *,
+    max_query_length: int = 7,
+    work_plan: PADecodePlan,
+    max_context_length: int | None = None,
+    exp_sums: torch.Tensor = None,
+    max_logits: torch.Tensor = None,
+    temporary_output: torch.Tensor = None,
+    sliding_window: int = 0,
+) -> None:
+    """One plan, one tile, and one reduce for a bidirectional mixed-width block.
+
+    Same packing as ``pa_decode_ragged``: width is ``qo_indptr[s + 1] -
+    qo_indptr[s]`` and query ``j`` of sequence ``s`` is packed row
+    ``qo_indptr[s] + j``. ``context_lengths[s]`` is the full block
+    (prefix + width). Every live query uses causal offset 0, so it sees
+    that whole length. The compile cache id is not the causal ragged
+    kernel. Rows past the width stay on the ragged skip rule.
+    """
+    if not isinstance(max_query_length, int) or max_query_length < 1:
+        raise ValueError("max_query_length must be a positive int")
+    pa_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        softmax_scale,
+        max_query_length,
+        work_plan=work_plan,
+        max_context_length=max_context_length,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
+        sliding_window=sliding_window,
+        qo_indptr=qo_indptr,
+        bidirectional=True,
     )

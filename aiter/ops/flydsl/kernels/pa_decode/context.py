@@ -40,6 +40,7 @@ class PaDecodeContext:
         qo_row_base_ptr=None,
         qo_indirect=None,
         ragged_tiles=False,
+        bidirectional=False,
     ):
         self.traits = traits
         self.shared_storage = shared_storage
@@ -69,6 +70,10 @@ class PaDecodeContext:
         # Host bool, baked into this specialization. When set, qo_row_base_ptr is
         # qo_indptr of length num_seqs+1 and each sequence has its own width.
         self.ragged_tiles = bool(ragged_tiles)
+        # Host bool, baked into this specialization. Live rows use causal
+        # offset 0 so each query sees the full context length. Separate from
+        # the causal ragged specialization so a draft graph does not reuse it.
+        self.bidirectional = bool(bidirectional)
         self.qlen = None
 
     def init_query_length(self):
@@ -140,6 +145,13 @@ class PaDecodeContext:
     def init_causal_offsets(self):
         # Distance to the newest query keeps causal bounds tile-relative.
         if const_expr(self.ragged_tiles):
+            if const_expr(self.bidirectional):
+                # Every live query attends through the full context length.
+                # Past-width rows are still dropped by the reducer.
+                self.causal_offset = [
+                    fx.Int32(0) for _m in range_constexpr(self.traits.M_TILES)
+                ]
+                return
             # Live rows use width-1-j, matching uniform pa_decode at that width.
             # Rows past the width reuse the last live query and are not stored.
             offsets = []
