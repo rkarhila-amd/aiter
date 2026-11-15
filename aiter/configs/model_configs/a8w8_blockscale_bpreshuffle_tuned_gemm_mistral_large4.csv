@@ -1,0 +1,7 @@
+gfx,cu_num,M,N,K,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
+gfx950,256,21696,2048,6144,flydsl,1,0,221.2418,flydsl_blockscale_8w_256x256x128_F8_F8_B16_ps1,2467.88,1061.06,0.0
+gfx950,256,21696,3072,6144,flydsl,1,0,314.7167,flydsl_blockscale_8w_256x256x128_F8_F8_B16_ps1,2602.33,907.09,0.0
+gfx950,256,21696,4096,6144,flydsl,1,0,430.3427,flydsl_blockscale_8w_256x256x128_F8_F8_B16_ps1,2537.5,781.24,0.0
+gfx950,256,32768,2048,6144,flydsl,1,0,319.3436,flydsl_blockscale_8w_256x256x128_F8_F8_B16_ps1,2582.28,1090.13,0.0
+gfx950,256,32768,3072,6144,flydsl,1,0,459.2881,flydsl_blockscale_8w_256x256x128_F8_F8_B16_ps1,2693.19,917.78,0.0
+gfx950,256,32768,4096,6144,flydsl,1,0,593.3721,flydsl_blockscale_8w_256x256x128_F8_F8_B16_ps1,2779.48,834.09,0.0
