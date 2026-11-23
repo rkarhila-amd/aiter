@@ -191,6 +191,142 @@ def test_unsafe_tuned_cktile_stage2_is_discarded(monkeypatch, kernel_name2):
     assert _stage_backend(meta.stage2) == "flydsl"
 
 
+_FP4_STAGE1 = "flydsl_moe1_afp4_wfp4_bf16_t32x32x256_kw2_fp4"
+_FP8_STAGE1 = "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w4_gui_fp8"
+
+
+@_SKIP
+@pytest.mark.parametrize(
+    ("q_dtype_a", "inter_dim", "kernel_name1", "kernel_name2", "pad", "stage1_pad"),
+    [
+        # Stage 2s that read every column: stage 1 must write them all.
+        (
+            dtypes.fp4x2,
+            INTER_DIM,
+            _FP4_STAGE1,
+            "flydsl_moe2_layout_afp4_wfp4_bf16_t32x128x128_atomic_nt_sbm32",
+            64,
+            0,
+        ),
+        (
+            dtypes.fp4x2,
+            INTER_DIM,
+            _FP4_STAGE1,
+            (
+                "moe_ck2stages_gemm2_64x32x32x128_1x1_MulABScaleExpertWeightShuffled"
+                "_v1_Nswizzle0_Quant3_MulRoutedWeight1_FP4X2_FP4X2_B16"
+            ),
+            64,
+            0,
+        ),
+        (
+            dtypes.fp8,
+            INTER_DIM,
+            "opus_moe1_afp8_wfp4_bf16_t32x384_pair_kw7_m3_fp8",
+            "flydsl_moe2_layout_afp8_wfp4_bf16_t32x128x128_atomic_nt_sbm32",
+            64,
+            0,
+        ),
+        # Stage 2s that skip whole 128-column blocks: at most tile_k for v1 FlyDSL.
+        (dtypes.fp8, 512, _FP8_STAGE1, "cktile_a8w4_bm32", 192, 128),
+        (
+            dtypes.fp4x2,
+            INTER_DIM,
+            _FP4_STAGE1,
+            "flydsl_moe2_afp4_wfp4_bf16_t32x128x128_atomic",
+            64,
+            0,
+        ),
+        (
+            dtypes.fp4x2,
+            INTER_DIM,
+            _FP4_STAGE1,
+            "flydsl_moe2_afp4_wfp4_bf16_t32x128x128_atomic",
+            256,
+            128,
+        ),
+        # A tile_k of 256 runs as 128 unless 256 divides inter_dim.
+        (
+            dtypes.fp4x2,
+            384,
+            _FP4_STAGE1,
+            "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_atomic",
+            256,
+            128,
+        ),
+        (
+            dtypes.fp4x2,
+            768,
+            _FP4_STAGE1,
+            "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_atomic",
+            384,
+            256,
+        ),
+        # The Opus stage 2 reads only the unpadded width.
+        (
+            dtypes.fp8,
+            INTER_DIM,
+            _FP8_STAGE1,
+            "opus_moe2_afp8_wfp4_atomic_t32x128x256_sbm32_occ1_cache_b2_ws2",
+            64,
+            64,
+        ),
+    ],
+)
+def test_padded_stage1_writes_the_columns_stage2_reads(
+    monkeypatch, q_dtype_a, inter_dim, kernel_name1, kernel_name2, pad, stage1_pad
+):
+    key = (
+        fused_moe_module.get_gfx_runtime(),
+        fused_moe_module.get_cu_num(),
+        TOKEN,
+        MODEL_DIM,
+        inter_dim,
+        E,
+        TOPK,
+        str(ActivationType.Silu),
+        str(dtypes.bf16),
+        str(q_dtype_a),
+        str(dtypes.fp4x2),
+        str(QuantType.per_1x32),
+        True,
+        False,
+    )
+    cfg = {
+        "block_m": 32,
+        "ksplit": 0,
+        "kernelName1": kernel_name1,
+        "kernelName2": kernel_name2,
+        "run_1stage": False,
+    }
+    monkeypatch.setattr(fused_moe_module, "cfg_2stages", ({key: cfg}, {}))
+    get_2stage_cfgs.cache_clear()
+    try:
+        meta = get_2stage_cfgs(
+            TOKEN,
+            MODEL_DIM,
+            inter_dim,
+            E,
+            TOPK,
+            dtypes.bf16,
+            q_dtype_a,
+            dtypes.fp4x2,
+            QuantType.per_1x32,
+            True,
+            ActivationType.Silu,
+            False,
+            0,
+            pad,
+            is_shuffled=True,
+            opus_weights_shuffled=True,
+        )
+    finally:
+        get_2stage_cfgs.cache_clear()
+
+    assert meta.stage1.keywords["kernelName"] == kernel_name1
+    assert meta.stage1.keywords["inter_dim_pad"] == stage1_pad
+
+
 @_SKIP
 def test_cktile_stage2_rejects_unsafe_mxfp4_shape(monkeypatch):
     monkeypatch.setattr(
@@ -273,6 +409,58 @@ def test_shuffle_scale_standard_layout_initializes_padding(dtype, src_value, pad
     assert padded[0, 0].item() == src_value
     padded[0, 0] = pad_value
     assert torch.all(padded == pad_value)
+
+
+def test_swiglu_mxfp4_a4w4_unsafe_shapes_stay_bf16_past_the_bound():
+    """MiniMax-M3-MXFP4 TP8 (expert=129 fused shared expert, inter_dim=512):
+    the fp4-activation path past GPTOSS_SWIGLU_MXFP4_BF16_BOUND tokens is
+    measured numerically broken for this shape (test_fmoe logits_diff ~2e-5
+    at token<256 vs ~0.073 at token>=256, well past the project's 0.01 bound).
+    Regression guard for that silent corruption: this exact (expert, inter_dim)
+    must stay on bf16 activations regardless of token count.
+    """
+    for token in (1, 255, 256, 1024, 4096):
+        assert (
+            fused_moe_module.resolve_activation_dtype(
+                QuantType.per_1x32,
+                dtypes.fp4x2,
+                activation=ActivationType.Swiglu,
+                gate_mode=GateMode.SEPARATED,
+                M=token,
+                expert=129,
+                inter_dim=512,
+            )
+            == dtypes.bf16
+        )
+
+
+def test_swiglu_mxfp4_bf16_bound_still_applies_outside_unsafe_shapes():
+    """Negative control: the general token-count bound is untouched for a
+    shape not in the unsafe set."""
+    assert (
+        fused_moe_module.resolve_activation_dtype(
+            QuantType.per_1x32,
+            dtypes.fp4x2,
+            activation=ActivationType.Swiglu,
+            gate_mode=GateMode.SEPARATED,
+            M=255,
+            expert=257,
+            inter_dim=512,
+        )
+        == dtypes.bf16
+    )
+    assert (
+        fused_moe_module.resolve_activation_dtype(
+            QuantType.per_1x32,
+            dtypes.fp4x2,
+            activation=ActivationType.Swiglu,
+            gate_mode=GateMode.SEPARATED,
+            M=256,
+            expert=257,
+            inter_dim=512,
+        )
+        == dtypes.fp4x2
+    )
 
 
 if __name__ == "__main__":
