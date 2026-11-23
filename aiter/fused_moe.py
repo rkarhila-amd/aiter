@@ -150,6 +150,17 @@ def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
 
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
+# (expert, inter_dim) shapes where the Swiglu MXFP4 FP4-activation (A4W4) path
+# above _SWIGLU_MXFP4_BF16_BOUND tokens is measured numerically broken, not
+# just slower. MiniMax-M3-MXFP4 TP8 (fused shared expert: 128 routed + 1
+# shared = 129, inter_dim=512 per-rank) via aiter's own test_fmoe harness:
+# logits_diff ~2e-5 (correct) at token<256, jumping to ~0.073 (project's own
+# correctness bound is 0.01) at token>=256 -- exactly where this dispatch
+# switches activations to fp4x2. The bound mechanism predates MiniMax-M3 and
+# was validated against GPT-OSS's shapes, not this one; stay on bf16
+# activations here regardless of token count until the A4W4 kernel itself is
+# fixed for this shape.
+_SWIGLU_MXFP4_A4W4_UNSAFE_SHAPES = {(129, 512)}
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 # (num_experts, topk) pairs the HIP kernel is instantiated for; must stay in
 # sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
@@ -1121,6 +1132,8 @@ def resolve_activation_dtype(
     has_a1_scale: bool = False,
     gfx: str | None = None,
     gate_up_interleave: bool | None = None,
+    expert: int | None = None,
+    inter_dim: int | None = None,
 ) -> torch.dtype | None:
     """The activation dtype fused_moe() quantizes its input to.
 
@@ -1135,6 +1148,11 @@ def resolve_activation_dtype(
 
     `q_dtype_w` is `w1.dtype`; `hidden_dtype` / `has_a1_scale` only matter for
     the per_1x128 fp8 passthrough.
+
+    `expert` / `inter_dim` gate the Swiglu MXFP4 BF16->FP4 activation switch
+    (see `_SWIGLU_MXFP4_A4W4_UNSAFE_SHAPES`) against shapes measured to be
+    numerically broken in that path. Omit them only when the caller cannot
+    know the shape yet (matches the `M is None` deferral above).
     """
     quant_type = QuantType(quant_type)
     quant_type = quant_remap.get(quant_type, quant_type)
@@ -1173,9 +1191,12 @@ def resolve_activation_dtype(
             else:
                 q_dtype_a = dtypes.bf16
         elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
-            q_dtype_a = _bound_split(
-                M, _SWIGLU_MXFP4_BF16_BOUND, dtypes.bf16, dtypes.fp4x2
-            )
+            if (expert, inter_dim) in _SWIGLU_MXFP4_A4W4_UNSAFE_SHAPES:
+                q_dtype_a = dtypes.bf16
+            else:
+                q_dtype_a = _bound_split(
+                    M, _SWIGLU_MXFP4_BF16_BOUND, dtypes.bf16, dtypes.fp4x2
+                )
         elif activation == ActivationType.Relu2:
             q_dtype_a = dtypes.bf16
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
@@ -1955,6 +1976,8 @@ def _fused_moe_impl(
         hidden_dtype=hidden_states.dtype,
         has_a1_scale=a1_scale is not None,
         gate_up_interleave=getattr(w1, "gate_up_interleave", None),
+        expert=E,
+        inter_dim=inter_dim,
     )
 
     if quant_dtype_a is not None:
@@ -5727,9 +5750,11 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
-    # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue
-    # and, for gfx942 per-token FP8, the FlyDSL backend, so it must reject ASM
-    # 1-stage and other FlyDSL whole-graph rows before they resolve.
+    # Runtime SiLU clamping runs only in CK stage 1 (in its non-split epilogue, or
+    # in silu_and_mul after a per_1x128 split-K reduction) and, for gfx942
+    # per-token FP8, in the FlyDSL backend. Apart from those FlyDSL rows, tuned
+    # rows are kept only for non-split CK SiLU kernels, so ASM 1-stage, split-K
+    # and other FlyDSL whole-graph rows are rejected before they resolve.
     clamp_silu_limit = (
         bool(swiglu_limit)
         and q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
@@ -6068,8 +6093,10 @@ def get_2stage_cfgs(
         kernelName2 = kernelName2.replace("_afp4_", "_afp8_", 1)
 
     if clamp_silu_limit:
-        # Deliberately override tuned, heuristic and AITER_KSPLIT selections.
-        ksplit = 0
+        # Only per_1x128 has a CK split-K stage 1 that clamps after the reduction
+        # (ck_moe_stage1); the other clamped types run non-split.
+        if q_type != QuantType.per_1x128:
+            ksplit = 0
         run_1stage = False
 
     reroute_a16wmix_bf16 = _can_reroute_bf16_to_a16wmix(
@@ -6200,20 +6227,41 @@ def get_2stage_cfgs(
             and q_dtype_w == dtypes.fp4x2
         )
         _s1_fp4q = is_flydsl1 and "_fp4" in kernelName1.split("_t")[-1]
+        # Given a pad, stage 1 may leave that many trailing columns of its uninitialized
+        # output unwritten, so it gets only the columns its stage 2 skips: the Opus stage
+        # 2 reads the unpadded width, the v1 FlyDSL one skips whole 128-column blocks of
+        # the last K tile it runs with (resolve_flydsl_stage2_tile_k), CK-Tile whole
+        # 128-column blocks, and the v2 layout and CK ones read every column. Stage 1
+        # computes the others: zero from w1's zero padding, times w2's zero padding.
+        if is_opus2:
+            stage1_inter_dim_pad = intermediate_pad
+        elif is_flydsl2 and not is_flydsl2_layout:
+            flydsl_moe_kernels = _get_flydsl_moe_kernels()
+            params2 = flydsl_moe_kernels.get_flydsl_kernel_params(kernelName2)
+            if params2 is None:
+                raise ValueError(f"Invalid FlyDSL GEMM2 kernel name: {kernelName2}")
+            tile_k2 = flydsl_moe_kernels.resolve_flydsl_stage2_tile_k(
+                inter_dim, params2["tile_k"]
+            )
+            stage1_inter_dim_pad = min(tile_k2, intermediate_pad // 128 * 128)
+        elif is_cktile2:
+            stage1_inter_dim_pad = intermediate_pad // 128 * 128
+        else:
+            stage1_inter_dim_pad = 0
         if is_opus1:
             stage1_func = functools.partial(
                 _opus_a8w4_stage1_wrapper,
                 kernelName=kernelName1,
                 activation=activation,
                 block_m=block_m,
-                inter_dim_pad=intermediate_pad,
+                inter_dim_pad=stage1_inter_dim_pad,
             )
         elif is_flydsl1:
             stage1_func = functools.partial(
                 _flydsl_stage1_wrapper,
                 kernelName=kernelName1,
                 activation=activation,
-                inter_dim_pad=intermediate_pad,
+                inter_dim_pad=stage1_inter_dim_pad,
                 model_dim_pad=hidden_pad,
             )
         else:
@@ -6854,6 +6902,46 @@ def fused_moe_2stages(
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
+    if metadata.run_1stage:
+        # metadata.stage1 may be a complete, single-call kernel (e.g.
+        # fused_moe_1stage) rather than a genuine stage1-of-two: its return
+        # value IS the final output, not an intermediate for stage2 to
+        # consume. _fused_moe_impl's own top-level dispatch already knows
+        # this and returns metadata.stage1(...) directly without ever
+        # calling a stage2 (see its own `if metadata.run_1stage:` branch
+        # above in this file). This function must do the same whenever it
+        # is handed, or itself resolves, a run_1stage=True metadata --
+        # unconditionally treating _stage1_call()'s result as an
+        # intermediate either crashes on an argument-convention mismatch
+        # (stage1-of-two and 1-stage kernels take different arguments) or,
+        # worse, silently reruns stage2 over an already-finished result.
+        return _return_output(
+            metadata.stage1(
+                hidden_states,
+                w1,
+                w2,
+                topk,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_out,
+                isG1U1,
+                block_size_M,
+                q_dtype_a=q_dtype_a,
+                q_dtype_w=q_dtype_w,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                num_local_tokens=num_local_tokens,
+                M=token_num,
+                device=device,
+                doweight_stage1=doweight_stage1,
+                expert_mask=expert_mask,
+            ),
+            output,
+        )
     if (
         getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
         and metadata.output_aux == AUX_SORT_OPUS
@@ -7297,6 +7385,14 @@ def torch_moe_act(act_input, torch_act, inter_dim, activation=None):
         return torch_act(gate) * up
 
 
+def _silu_and_mul_limit(swiglu_limit):
+    # silu_and_mul takes a float32 limit, 0.0 = no clamp. Keep a positive limit
+    # from narrowing to 0 or inf, like the CK launcher does.
+    if not swiglu_limit:
+        return 0.0
+    return min(max(swiglu_limit, 2.0**-149), torch.finfo(dtypes.fp32).max)
+
+
 def asm_stage1(
     input,
     w1,
@@ -7363,14 +7459,9 @@ def asm_stage1(
     )
     if ksplit > 0:
         if activation == ActivationType.Silu:
-            # silu_and_mul takes a float32 limit. Keep a positive limit from
-            # narrowing to 0 (no clamp) or inf, like the CK launcher does.
-            limit = (
-                min(max(swiglu_limit, 2.0**-149), torch.finfo(dtypes.fp32).max)
-                if swiglu_limit
-                else 0.0
+            aiter.silu_and_mul(
+                out, tmp_out.view(dtypes.fp32), _silu_and_mul_limit(swiglu_limit)
             )
-            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32), limit)
         elif activation == ActivationType.Swiglu:
             aiter.swiglu_and_mul(out, tmp_out.view(dtypes.fp32))
         elif activation == ActivationType.Gelu:
@@ -7802,7 +7893,11 @@ def ck_moe_stage1(
                 raise ValueError(
                     "Runtime SiLU clamp requires a non-split CK SiLU kernel"
                 )
-            splitk = 0
+            # A named kernel runs non-split and clamps in its epilogue. An unnamed
+            # per_1x128 split-K launch writes raw fp32 gate|up, clamped by
+            # silu_and_mul after the reduction below.
+            if kernelName:
+                splitk = 0
     token_num = hidden_states.shape[0]
     is_splitk = quant_type == QuantType.per_1x128 and splitk > 1
     if is_splitk:
@@ -7832,12 +7927,14 @@ def ck_moe_stage1(
         splitk if is_splitk else 0,
         use_non_temporal_load,
         out.dtype,
-        limit,
+        None if is_splitk else limit,
     )
     if is_splitk:
         valid_out = tmp_out[: token_num * topk, :]
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
+            aiter.silu_and_mul(
+                out, valid_out.view(dtypes.fp32), _silu_and_mul_limit(limit)
+            )
         elif activation == ActivationType.Gelu:
             aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
         else:
