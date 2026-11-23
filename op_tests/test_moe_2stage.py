@@ -3,6 +3,7 @@
 
 import argparse
 import gc
+import inspect
 import itertools
 import logging
 import os
@@ -465,7 +466,7 @@ def test_fmoe(
         and WQDType == dtypes.fp4x2
     ):
         runtime_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
-            token, actType, gateMode, qType, AQDType, WQDType
+            token, actType, gateMode, qType, AQDType, WQDType, expert=E, inter_dim=inter_dim
         )
         if runtime_aq_dtype == dtypes.fp4x2:
             metadata = get_2stage_cfgs(
@@ -1037,6 +1038,8 @@ def _iter_csv_cases():
                 kwargs["qType"],
                 kwargs["AQDType"],
                 kwargs["WQDType"],
+                expert=kwargs["E"],
+                inter_dim=kwargs["inter_dim"],
             )
             runtime_mode = "Swiglu MXFP4"
         if expected_aq_dtype is not None and kwargs["AQDType"] != expected_aq_dtype:
@@ -1176,7 +1179,7 @@ def _runtime_situv2_mxfp4_q_dtype_a(q_type, wq_dtype):
 
 
 def _runtime_swiglu_mxfp4_q_dtype_a(
-    token, act_type, gate_mode, q_type, aq_dtype, wq_dtype
+    token, act_type, gate_mode, q_type, aq_dtype, wq_dtype, expert=None, inter_dim=None
 ):
     """Return the q_dtype_a that fused_moe will select for Swiglu MXFP4."""
     if act_type != aiter.ActivationType.Swiglu:
@@ -1188,6 +1191,10 @@ def _runtime_swiglu_mxfp4_q_dtype_a(
 
     gate_mode = GateMode(gate_mode)
     if gate_mode == GateMode.SEPARATED:
+        # Shapes measured numerically broken in the fp4-activation path
+        # regardless of token count -- see fused_moe._SWIGLU_MXFP4_A4W4_UNSAFE_SHAPES.
+        if (expert, inter_dim) in aiter.fused_moe._SWIGLU_MXFP4_A4W4_UNSAFE_SHAPES:
+            return dtypes.bf16
         bound = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
         return dtypes.bf16 if token < bound else dtypes.fp4x2
 
@@ -2544,8 +2551,8 @@ def _quant_blockscale_weight(w):
 
 
 @benchmark()
-def test_blockscale_swiglu_limit(token, swiglu_limit):
-    model_dim, inter_dim, experts, topk = 256, 256, 8, 2
+def test_blockscale_swiglu_limit(token, swiglu_limit, model_dim=256):
+    inter_dim, experts, topk = 256, 8, 2
     torch.manual_seed(token)
     x = torch.randn(token, model_dim, dtype=dtypes.bf16)
     w1, s1 = _quant_blockscale_weight(
@@ -2608,19 +2615,43 @@ def test_blockscale_swiglu_limit(token, swiglu_limit):
     w1_sh = shuffle_weight(w1, layout=(16, 16))
     w2_sh = shuffle_weight(w2, layout=(16, 16))
     out = torch.empty(token, model_dim, dtype=dtypes.bf16)
-    actual = fused_moe(
-        x,
-        w1_sh,
-        w2_sh,
-        weights,
-        ids,
-        w1_scale=s1,
-        w2_scale=s2,
-        quant_type=aiter.QuantType.per_128x128,
-        activation=aiter.ActivationType.Silu,
-        swiglu_limit=swiglu_limit,
-        output=out,
-    )
+    stage1_fwd, silu_and_mul = aiter.ck_moe_stage1_fwd, aiter.silu_and_mul
+    stage1_sig = inspect.signature(stage1_fwd)
+    launches, act_limits = [], []
+
+    def spy_stage1_fwd(*args, **kwargs):
+        bound = stage1_sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        launches.append((bound.arguments["splitk"], bound.arguments["swiglu_limit"]))
+        return stage1_fwd(*args, **kwargs)
+
+    def spy_silu_and_mul(dst, src, limit=0.0):
+        act_limits.append(limit)
+        return silu_and_mul(dst, src, limit)
+
+    aiter.ck_moe_stage1_fwd, aiter.silu_and_mul = spy_stage1_fwd, spy_silu_and_mul
+    try:
+        actual = fused_moe(
+            x,
+            w1_sh,
+            w2_sh,
+            weights,
+            ids,
+            w1_scale=s1,
+            w2_scale=s2,
+            quant_type=aiter.QuantType.per_128x128,
+            activation=aiter.ActivationType.Silu,
+            swiglu_limit=swiglu_limit,
+            output=out,
+        )
+    finally:
+        aiter.ck_moe_stage1_fwd, aiter.silu_and_mul = stage1_fwd, silu_and_mul
+    if swiglu_limit is not None and model_dim == 1024:
+        # The heuristic splits K=1024 at one token: the split-K launch runs
+        # unclamped and silu_and_mul clamps after the reduction.
+        assert len(launches) == 1 and launches[0][0] > 1, launches
+        assert launches[0][1] is None, launches
+        assert act_limits == [swiglu_limit], act_limits
     msg = f"blockscale limit={swiglu_limit}"
     err = checkAllclose(ref.float(), actual.float(), rtol=0.05, atol=0.05, msg=msg)
     logits_diff = logits_difference(ref, actual)
@@ -2652,6 +2683,19 @@ def test_swiglu_limit_guards():
     q = aiter.QuantType.No
     raises(NotImplementedError, ck, *([None] * 11), quant_type=q, **kw)
     raises(NotImplementedError, asm, *([None] * 9), ksplit=0, **kw)
+    # Only unnamed launches split under a limit: a named Splitk kernel raises.
+    w1 = torch.empty(1, dtype=dtypes.fp8)
+    raises(
+        ValueError,
+        ck,
+        None,
+        w1,
+        *([None] * 9),
+        kernelName="gemm1_silu_Splitk",
+        splitk=4,
+        quant_type=aiter.QuantType.per_1x128,
+        **kw,
+    )
 
 
 def run_blockscale_limit_cases():
@@ -2661,6 +2705,9 @@ def run_blockscale_limit_cases():
         # Without a limit, token > 32 takes the untuned ASM 1-stage default,
         # which picks a flat kernel for sorted inputs at model_dim 256 on gfx942.
         if limit is not None or token <= 32
+    ] + [
+        test_blockscale_swiglu_limit(1, limit, model_dim=1024)
+        for limit in (1.0, 7.0, None)
     ]
     aiter.logger.info(
         "blockscale SiLU limit summary (markdown):\n%s",
